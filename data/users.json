@@ -1,0 +1,27 @@
+[
+  {
+    "id": "USR-7001",
+    "name": "Amit Patel",
+    "email": "amit.patel@gmail.com",
+    "phone": "9811223344",
+    "password": "user123",
+    "cart": [
+      {
+        "id": "prod-cctv-4k",
+        "title": "4K AI Starlight CCTV Dome Camera",
+        "price": 18500,
+        "image": "/images/cctv.jpg",
+        "quantity": 2
+      }
+    ],
+    "wishlist": [
+      {
+        "id": "prod-speedgate-opt",
+        "title": "Biometric Optical Speed Gate Barrier",
+        "price": 125000,
+        "image": "/images/speedgates.jpg"
+      }
+    ],
+    "createdAt": "2026-08-26T12:31:53.082Z"
+  }
+]

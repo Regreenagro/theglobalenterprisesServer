@@ -1,0 +1,7 @@
+{
+  "id": "admin",
+  "email": "admin@theglobal.com",
+  "name": "Global Admin Board",
+  "password": "admin123",
+  "role": "Super Admin"
+}

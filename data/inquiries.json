@@ -1,0 +1,32 @@
+[
+  {
+    "id": "INQ-6125",
+    "name": "Vijay",
+    "company": "Scheduled Consultation Lead",
+    "phone": "9027799171",
+    "email": "vijay@gmail.com",
+    "service": "Scheduled Meeting: Integrated Workspace Architecture",
+    "budget": "Consultation Session",
+    "location": "Virtual Meeting Slot: 2026-08-28 @ 11:00 AM - 12:00 PM",
+    "message": "User scheduled a executive consultation on Integrated Workspace Architecture for 2026-08-28 during 11:00 AM - 12:00 PM.",
+    "status": "New",
+    "read": true,
+    "notes": "",
+    "createdAt": "2026-08-26T12:37:34.310Z"
+  },
+  {
+    "id": "INQ-8337",
+    "name": "Ramesh ",
+    "company": "Scheduled Consultation Lead",
+    "phone": "9027799171",
+    "email": "ramesh@gmail.com",
+    "service": "Scheduled Meeting: 4K Surveillance & Access Systems",
+    "budget": "Consultation Session",
+    "location": "Virtual Meeting Slot: 2026-08-28 @ 11:00 AM - 12:00 PM",
+    "message": "User scheduled a executive consultation on 4K Surveillance & Access Systems for 2026-08-28 during 11:00 AM - 12:00 PM.",
+    "status": "New",
+    "read": true,
+    "notes": "",
+    "createdAt": "2026-08-26T12:24:04.073Z"
+  }
+]
