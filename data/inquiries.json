@@ -1,5 +1,21 @@
 [
   {
+    "id": "INQ-5643",
+    "name": "Rohit Pal",
+    "company": "Scheduled Consultation",
+    "phone": "9855664729",
+    "email": "Rohit@gmail.com",
+    "service": "Scheduled Meeting: 4K Surveillance & Access Systems",
+    "budget": "Consultation Session",
+    "location": "Virtual Meeting: 2026-08-30 (11:00 AM - 12:00 PM)",
+    "message": "Scheduled strategy consultation regarding 4K Surveillance & Access Systems for 2026-08-30 at 11:00 AM - 12:00 PM.",
+    "status": "Closed",
+    "read": true,
+    "notes": "",
+    "createdAt": "2026-08-29T12:12:31.445Z",
+    "updatedAt": "2026-08-29T12:17:23.701Z"
+  },
+  {
     "id": "INQ-6125",
     "name": "Vijay",
     "company": "Scheduled Consultation Lead",
@@ -9,10 +25,11 @@
     "budget": "Consultation Session",
     "location": "Virtual Meeting Slot: 2026-08-28 @ 11:00 AM - 12:00 PM",
     "message": "User scheduled a executive consultation on Integrated Workspace Architecture for 2026-08-28 during 11:00 AM - 12:00 PM.",
-    "status": "New",
+    "status": "Contacted",
     "read": true,
     "notes": "",
-    "createdAt": "2026-08-26T12:37:34.310Z"
+    "createdAt": "2026-08-26T12:37:34.310Z",
+    "updatedAt": "2026-08-29T12:17:31.803Z"
   },
   {
     "id": "INQ-8337",
@@ -24,9 +41,10 @@
     "budget": "Consultation Session",
     "location": "Virtual Meeting Slot: 2026-08-28 @ 11:00 AM - 12:00 PM",
     "message": "User scheduled a executive consultation on 4K Surveillance & Access Systems for 2026-08-28 during 11:00 AM - 12:00 PM.",
-    "status": "New",
+    "status": "In Progress",
     "read": true,
     "notes": "",
-    "createdAt": "2026-08-26T12:24:04.073Z"
+    "createdAt": "2026-08-26T12:24:04.073Z",
+    "updatedAt": "2026-08-29T12:17:28.744Z"
   }
 ]
