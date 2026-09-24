@@ -170,6 +170,7 @@ const inquirySchema = new mongoose.Schema({
 
 const adminSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
+  username: { type: String, default: 'admin', trim: true, index: true },
   email: { type: String, required: true },
   phone: { type: String, default: '9899933768' },
   name: { type: String, default: 'Global Admin Board' },
@@ -185,8 +186,9 @@ const Admin = mongoose.models.Admin || mongoose.model('Admin', adminSchema);
 // Initial fallback admin data
 const defaultAdmin = {
   id: 'admin',
-  email: 'admin@theglobal.com',
-  phone: '9899933768',
+  username: process.env.ADMIN_INITIAL_USERNAME || 'admin',
+  email: process.env.ADMIN_INITIAL_EMAIL || 'admin@theglobal.com',
+  phone: process.env.ADMIN_INITIAL_PHONE || '9899933768',
   name: 'Global Admin Board',
   password: hashPassword(process.env.ADMIN_INITIAL_PASSWORD || 'admin123'),
   role: 'Super Admin'
@@ -203,23 +205,20 @@ async function connectMongoDB() {
     });
     console.log('[GLOBAL ENTERPRISES] 🍃 Connected to MongoDB Atlas successfully.');
 
-    // Seed or migrate Admin account
-    const existingAdmin = await Admin.findOne({ id: defaultAdmin.id });
+    // Seed or migrate Admin account with username & password
+    const existingAdmin = await Admin.findOne({
+      $or: [{ id: defaultAdmin.id }, { username: defaultAdmin.username }, { email: defaultAdmin.email }]
+    });
+
     if (!existingAdmin) {
-      const localAdmin = readJSON(ADMIN_FILE, defaultAdmin);
-      const pass = localAdmin.password && localAdmin.password.includes(':')
-        ? localAdmin.password
-        : hashPassword(localAdmin.password || 'admin123');
-      
-      await Admin.create({
-        id: localAdmin.id || 'admin',
-        email: localAdmin.email || 'admin@theglobal.com',
-        phone: localAdmin.phone || '9899933768',
-        name: localAdmin.name || 'Global Admin Board',
-        password: pass,
-        role: localAdmin.role || 'Super Admin'
-      });
-      console.log('[GLOBAL ENTERPRISES] ✅ Initialized admin account in MongoDB.');
+      await Admin.create(defaultAdmin);
+      console.log('[GLOBAL ENTERPRISES] ✅ Initialized admin account (Username: admin, Password: admin123) in MongoDB.');
+    } else {
+      if (!existingAdmin.username) {
+        existingAdmin.username = 'admin';
+        await existingAdmin.save();
+        console.log('[GLOBAL ENTERPRISES] ✅ Updated existing admin record with username "admin" in MongoDB.');
+      }
     }
 
     // Auto-migrate local inquiries from JSON to MongoDB if collection is empty
@@ -260,16 +259,23 @@ app.use((req, res, next) => {
   next();
 });
 
-const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3000,http://localhost:3001,http://localhost:5173,https://globalenterprises.in')
+const allowedOrigins = (process.env.CORS_ORIGIN || 'https://theglobalenterprises.vercel.app,http://localhost:3000,http://localhost:3001,http://localhost:5173,https://globalenterprises.in')
   .split(',')
-  .map(o => o.trim());
+  .map(o => o.trim().replace(/\/$/, ''));
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+    if (!origin) return callback(null, true);
+    const cleanOrigin = origin.replace(/\/$/, '');
+    if (
+      allowedOrigins.includes(cleanOrigin) ||
+      allowedOrigins.includes('*') ||
+      cleanOrigin === 'https://theglobalenterprises.vercel.app' ||
+      cleanOrigin.endsWith('.vercel.app')
+    ) {
       return callback(null, true);
     }
-    return callback(new Error('CORS Policy: Origin not allowed.'));
+    return callback(new Error(`CORS Policy: Origin ${origin} not allowed.`));
   },
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -526,6 +532,7 @@ app.post('/api/admin/login', loginLimiter, async (req, res) => {
       adminRecord = await Admin.findOne({
         $or: [
           { id: cleanId },
+          { username: cleanId },
           { email: cleanId },
           { phone: cleanId }
         ]
@@ -537,6 +544,7 @@ app.post('/api/admin/login', loginLimiter, async (req, res) => {
       const localAdmin = readJSON(ADMIN_FILE, defaultAdmin);
       const isMatch = 
         cleanId === (localAdmin.id || '').toLowerCase() ||
+        cleanId === (localAdmin.username || '').toLowerCase() ||
         cleanId === (localAdmin.email || '').toLowerCase() ||
         cleanId === localAdmin.phone;
       
