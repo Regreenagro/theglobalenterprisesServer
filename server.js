@@ -163,7 +163,9 @@ const inquirySchema = new mongoose.Schema({
   metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
   status: { type: String, default: 'New', enum: ['New', 'In Progress', 'Contacted', 'Closed'] },
   read: { type: Boolean, default: false },
-  notes: { type: String, default: '' }
+  notes: { type: String, default: '' },
+  isDeleted: { type: Boolean, default: false },
+  deletedAt: { type: Date, default: null }
 }, {
   timestamps: true
 });
@@ -389,6 +391,8 @@ function normalizeInquiry(inq) {
     status: inq.status || 'New',
     read: Boolean(inq.read),
     notes: inq.notes || '',
+    isDeleted: Boolean(inq.isDeleted),
+    deletedAt: inq.deletedAt || null,
     createdAt: inq.createdAt,
     updatedAt: inq.updatedAt
   };
@@ -795,63 +799,19 @@ app.patch('/api/inquiries/:id', requireAdminAuth, async (req, res) => {
   }
 });
 
-// Delete Single Inquiry
-app.delete('/api/inquiries/:id', requireAdminAuth, async (req, res) => {
+// Clear / Empty All Inquiries In Recycle Bin
+app.delete('/api/inquiries/bin/clear', requireAdminAuth, async (req, res) => {
   try {
-    const { id } = req.params;
-
-    if (!id || !/^INQ-[a-zA-Z0-9_-]{1,20}$/.test(id)) {
-      return res.status(400).json({ success: false, message: 'Invalid inquiry ID format.' });
-    }
-
-    let deleted = false;
-
-    if (mongoose.connection.readyState === 1) {
-      const resDb = await Inquiry.findOneAndDelete({ id });
-      if (resDb) deleted = true;
-    }
-
-    // Also remove from local JSON file
-    try {
-      let localInqs = readJSON(INQUIRIES_FILE, []);
-      const prevLen = localInqs.length;
-      localInqs = localInqs.filter(inq => inq.id !== id);
-      if (localInqs.length !== prevLen) {
-        writeJSON(INQUIRIES_FILE, localInqs);
-        deleted = true;
-      }
-    } catch {}
-
-    if (!deleted) {
-      return res.status(404).json({ success: false, message: 'Inquiry record not found.' });
-    }
-
-    res.json({ success: true, message: `Inquiry ${id} deleted securely.` });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to delete inquiry.' });
-  }
-});
-
-// Bulk Delete Inquiries
-app.post('/api/inquiries/bulk-delete', requireAdminAuth, async (req, res) => {
-  try {
-    const { ids } = req.body;
-    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 100) {
-      return res.status(400).json({ success: false, message: 'Invalid lead IDs specified (maximum 100 at a time).' });
-    }
-
-    const validIds = ids.filter(id => typeof id === 'string' && /^INQ-[a-zA-Z0-9_-]{1,20}$/.test(id));
     let deletedCount = 0;
-
     if (mongoose.connection.readyState === 1) {
-      const resDb = await Inquiry.deleteMany({ id: { $in: validIds } });
+      const resDb = await Inquiry.deleteMany({ isDeleted: true });
       deletedCount = resDb.deletedCount;
     }
 
     try {
       let localInqs = readJSON(INQUIRIES_FILE, []);
       const prevLen = localInqs.length;
-      localInqs = localInqs.filter(inq => !validIds.includes(inq.id));
+      localInqs = localInqs.filter(inq => !inq.isDeleted);
       if (!deletedCount) {
         deletedCount = prevLen - localInqs.length;
       }
@@ -860,8 +820,224 @@ app.post('/api/inquiries/bulk-delete', requireAdminAuth, async (req, res) => {
 
     res.json({
       success: true,
-      message: `Successfully deleted ${deletedCount} record(s).`
+      message: `Recycle Bin emptied (${deletedCount} records permanently erased).`,
+      count: deletedCount
     });
+  } catch (err) {
+    console.error('Clear bin error:', err);
+    res.status(500).json({ success: false, message: 'Failed to clear Recycle Bin.' });
+  }
+});
+
+// Restore Single Inquiry from Bin
+app.post('/api/inquiries/:id/restore', requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || !/^INQ-[a-zA-Z0-9_-]{1,20}$/.test(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid inquiry ID format.' });
+    }
+
+    let updatedDoc = null;
+    if (mongoose.connection.readyState === 1) {
+      updatedDoc = await Inquiry.findOneAndUpdate(
+        { id },
+        { $set: { isDeleted: false, deletedAt: null } },
+        { new: true }
+      ).lean();
+    }
+
+    try {
+      const localInqs = readJSON(INQUIRIES_FILE, []);
+      const idx = localInqs.findIndex(i => i.id === id);
+      if (idx !== -1) {
+        localInqs[idx].isDeleted = false;
+        localInqs[idx].deletedAt = null;
+        localInqs[idx].updatedAt = new Date().toISOString();
+        writeJSON(INQUIRIES_FILE, localInqs);
+        if (!updatedDoc) updatedDoc = localInqs[idx];
+      }
+    } catch {}
+
+    if (!updatedDoc) {
+      return res.status(404).json({ success: false, message: 'Inquiry record not found.' });
+    }
+
+    res.json({
+      success: true,
+      message: `Inquiry ${id} recovered from Recycle Bin.`,
+      data: normalizeInquiry(updatedDoc)
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to restore inquiry.' });
+  }
+});
+
+// Bulk Restore Inquiries from Bin
+app.post('/api/inquiries/bulk-restore', requireAdminAuth, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 100) {
+      return res.status(400).json({ success: false, message: 'Invalid lead IDs specified.' });
+    }
+
+    const validIds = ids.filter(id => typeof id === 'string' && /^INQ-[a-zA-Z0-9_-]{1,20}$/.test(id));
+
+    if (mongoose.connection.readyState === 1) {
+      await Inquiry.updateMany(
+        { id: { $in: validIds } },
+        { $set: { isDeleted: false, deletedAt: null } }
+      );
+    }
+
+    try {
+      const localInqs = readJSON(INQUIRIES_FILE, []);
+      localInqs.forEach(inq => {
+        if (validIds.includes(inq.id)) {
+          inq.isDeleted = false;
+          inq.deletedAt = null;
+          inq.updatedAt = new Date().toISOString();
+        }
+      });
+      writeJSON(INQUIRIES_FILE, localInqs);
+    } catch {}
+
+    res.json({
+      success: true,
+      message: `Successfully recovered ${validIds.length} lead(s) from Recycle Bin.`
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Bulk restore failed.' });
+  }
+});
+
+// Delete Single Inquiry (Soft delete to Bin by default, permanent if ?permanent=true)
+app.delete('/api/inquiries/:id', requireAdminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const isPermanent = req.query.permanent === 'true';
+
+    if (!id || !/^INQ-[a-zA-Z0-9_-]{1,20}$/.test(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid inquiry ID format.' });
+    }
+
+    let found = false;
+
+    if (isPermanent) {
+      if (mongoose.connection.readyState === 1) {
+        const resDb = await Inquiry.findOneAndDelete({ id });
+        if (resDb) found = true;
+      }
+
+      try {
+        let localInqs = readJSON(INQUIRIES_FILE, []);
+        const prevLen = localInqs.length;
+        localInqs = localInqs.filter(inq => inq.id !== id);
+        if (localInqs.length !== prevLen) {
+          writeJSON(INQUIRIES_FILE, localInqs);
+          found = true;
+        }
+      } catch {}
+
+      if (!found) {
+        return res.status(404).json({ success: false, message: 'Inquiry record not found.' });
+      }
+
+      return res.json({ success: true, message: `Inquiry ${id} permanently deleted.` });
+    } else {
+      // Soft Delete: Move to Recycle Bin
+      const now = new Date();
+      if (mongoose.connection.readyState === 1) {
+        const resDb = await Inquiry.findOneAndUpdate(
+          { id },
+          { $set: { isDeleted: true, deletedAt: now } },
+          { new: true }
+        );
+        if (resDb) found = true;
+      }
+
+      try {
+        const localInqs = readJSON(INQUIRIES_FILE, []);
+        const idx = localInqs.findIndex(i => i.id === id);
+        if (idx !== -1) {
+          localInqs[idx].isDeleted = true;
+          localInqs[idx].deletedAt = now.toISOString();
+          localInqs[idx].updatedAt = now.toISOString();
+          writeJSON(INQUIRIES_FILE, localInqs);
+          found = true;
+        }
+      } catch {}
+
+      if (!found) {
+        return res.status(404).json({ success: false, message: 'Inquiry record not found.' });
+      }
+
+      return res.json({ success: true, message: `Inquiry ${id} moved to Recycle Bin.` });
+    }
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to process delete inquiry.' });
+  }
+});
+
+// Bulk Delete Inquiries (Soft delete to Bin by default, permanent if ?permanent=true)
+app.post('/api/inquiries/bulk-delete', requireAdminAuth, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    const isPermanent = req.query.permanent === 'true';
+
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 100) {
+      return res.status(400).json({ success: false, message: 'Invalid lead IDs specified (maximum 100 at a time).' });
+    }
+
+    const validIds = ids.filter(id => typeof id === 'string' && /^INQ-[a-zA-Z0-9_-]{1,20}$/.test(id));
+    const now = new Date();
+
+    if (isPermanent) {
+      let deletedCount = 0;
+      if (mongoose.connection.readyState === 1) {
+        const resDb = await Inquiry.deleteMany({ id: { $in: validIds } });
+        deletedCount = resDb.deletedCount;
+      }
+
+      try {
+        let localInqs = readJSON(INQUIRIES_FILE, []);
+        const prevLen = localInqs.length;
+        localInqs = localInqs.filter(inq => !validIds.includes(inq.id));
+        if (!deletedCount) {
+          deletedCount = prevLen - localInqs.length;
+        }
+        writeJSON(INQUIRIES_FILE, localInqs);
+      } catch {}
+
+      return res.json({
+        success: true,
+        message: `Successfully erased ${deletedCount || validIds.length} record(s) permanently.`
+      });
+    } else {
+      // Bulk soft delete: Move to Recycle Bin
+      if (mongoose.connection.readyState === 1) {
+        await Inquiry.updateMany(
+          { id: { $in: validIds } },
+          { $set: { isDeleted: true, deletedAt: now } }
+        );
+      }
+
+      try {
+        const localInqs = readJSON(INQUIRIES_FILE, []);
+        localInqs.forEach(inq => {
+          if (validIds.includes(inq.id)) {
+            inq.isDeleted = true;
+            inq.deletedAt = now.toISOString();
+            inq.updatedAt = now.toISOString();
+          }
+        });
+        writeJSON(INQUIRIES_FILE, localInqs);
+      } catch {}
+
+      return res.json({
+        success: true,
+        message: `Successfully moved ${validIds.length} lead(s) to Recycle Bin.`
+      });
+    }
   } catch (err) {
     res.status(500).json({ success: false, message: 'Bulk delete failed.' });
   }
