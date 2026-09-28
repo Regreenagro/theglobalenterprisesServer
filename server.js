@@ -223,21 +223,7 @@ async function connectMongoDB() {
       }
     }
 
-    // Auto-migrate local inquiries from JSON to MongoDB if collection is empty
-    const count = await Inquiry.countDocuments();
-    if (count === 0 && fs.existsSync(INQUIRIES_FILE)) {
-      const localInquiries = readJSON(INQUIRIES_FILE, []);
-      if (Array.isArray(localInquiries) && localInquiries.length > 0) {
-        for (const item of localInquiries) {
-          try {
-            await Inquiry.updateOne({ id: item.id }, { $set: item }, { upsert: true });
-          } catch (mErr) {
-            console.error(`Migration error for ${item.id}:`, mErr.message);
-          }
-        }
-        console.log(`[GLOBAL ENTERPRISES] 📥 Migrated ${localInquiries.length} local inquiries to MongoDB.`);
-      }
-    }
+
   } catch (err) {
     console.error('[GLOBAL ENTERPRISES] ⚠️ MongoDB connection error:', err.message);
   }
