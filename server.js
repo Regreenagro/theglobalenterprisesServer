@@ -1123,7 +1123,64 @@ function startServerWorker() {
   });
 
   // ==========================================
-  // 12. ERROR & 404 HANDLERS
+  // 12. STATIC CLIENT SERVING & SPA FALLBACK (CLEAN URLS)
+  // ==========================================
+  const CLIENT_DIST = path.join(__dirname, '../client/dist');
+  if (fs.existsSync(CLIENT_DIST)) {
+    // 1. Explicit sitemap.xml handler
+    app.get('/sitemap.xml', (_req, res) => {
+      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      const sitemapPath = path.join(CLIENT_DIST, 'sitemap.xml');
+      if (fs.existsSync(sitemapPath)) {
+        return res.sendFile(sitemapPath);
+      }
+      res.status(404).send('Sitemap not found');
+    });
+
+    // 2. Explicit robots.txt handler
+    app.get('/robots.txt', (_req, res) => {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      const robotsPath = path.join(CLIENT_DIST, 'robots.txt');
+      if (fs.existsSync(robotsPath)) {
+        return res.sendFile(robotsPath);
+      }
+      res.status(404).send('Robots.txt not found');
+    });
+
+    // 3. Immutable caching for hashed JS/CSS assets (1 Year)
+    app.use('/assets', express.static(path.join(CLIENT_DIST, 'assets'), {
+      maxAge: '1y',
+      immutable: true
+    }));
+
+    // 4. Static images caching (30 Days)
+    app.use('/images', express.static(path.join(CLIENT_DIST, 'images'), {
+      maxAge: '30d'
+    }));
+
+    // 5. General static files
+    app.use(express.static(CLIENT_DIST, {
+      maxAge: '1h',
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.html')) {
+          res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+        }
+      }
+    }));
+
+    // 6. SPA Catch-All fallback for clean browser URLs (/about, /services, /blog, etc.)
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api/')) {
+        return next();
+      }
+      res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+    });
+  }
+
+  // ==========================================
+  // 13. API 404 & ERROR HANDLERS
   // ==========================================
 
   app.use((req, res) => {
