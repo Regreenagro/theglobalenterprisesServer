@@ -4,6 +4,8 @@ import cors from 'cors';
 import compression from 'compression';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
+import Redis from 'ioredis';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
@@ -22,8 +24,21 @@ const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const CLUSTER_MODE = process.env.CLUSTER_MODE === 'true';
-const JWT_SECRET = process.env.JWT_SECRET || 'global-enterprises-production-secret-key-2026-secure-auth-jwt';
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://regreenagromarketing_db_user:3VQdk3BoRNFUWYgQ@cluster0.wcajcsh.mongodb.net/global_enterprises?appName=Cluster0';
+
+// ⚠️ SECURITY: NO hardcoded fallbacks for sensitive credentials
+if (!process.env.JWT_SECRET) {
+  console.error('[SECURITY] ❌ JWT_SECRET is not set in .env! Server refuses to start.');
+  process.exit(1);
+}
+if (!process.env.MONGODB_URI) {
+  console.error('[SECURITY] ❌ MONGODB_URI is not set in .env! Server refuses to start.');
+  process.exit(1);
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || (JWT_SECRET + '_refresh_v2');
+const MONGODB_URI = process.env.MONGODB_URI;
+const REDIS_URL = process.env.REDIS_URL || null; // Optional: falls back to in-memory if not set
 
 // Multi-Core Cluster Management for Concurrency
 const numCPUs = (typeof os.availableParallelism === 'function') ? os.availableParallelism() : os.cpus().length;
@@ -49,6 +64,77 @@ function startServerWorker() {
   // Trust first reverse proxy (Vercel, Render, Cloudflare, AWS ALB, Nginx)
   // Ensures accurate client IP resolution for rate limiters
   app.set('trust proxy', 1);
+
+  // ==========================================
+  // REDIS CLIENT (Shared Rate Limit Store)
+  // ==========================================
+  // Redis enables rate limits to work correctly across multiple
+  // cluster workers & server restarts — in-memory limiters break in cluster mode!
+  let redisClient = null;
+
+  if (REDIS_URL) {
+    redisClient = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      retryStrategy: (times) => Math.min(times * 100, 3000),
+      enableOfflineQueue: false,
+      lazyConnect: false,
+    });
+
+    redisClient.on('connect', () => console.log('[REDIS] ✅ Connected to Redis store.'));
+    redisClient.on('error', (err) => console.warn('[REDIS] ⚠️ Redis error (falling back gracefully):', err.message));
+  } else {
+    console.warn('[REDIS] ⚠️ REDIS_URL not set — using in-memory rate limiting (not suitable for multi-instance deployments).');
+  }
+
+  // Helper: build RedisStore or undefined (falls back to in-memory)
+  function makeRedisStore(prefix) {
+    if (!redisClient) return undefined;
+    return new RedisStore({
+      sendCommand: (...args) => redisClient.call(...args),
+      prefix: `rl:${prefix}:`,
+    });
+  }
+
+  // ==========================================
+  // AUDIT LOG — Track all admin actions
+  // ==========================================
+  const AUDIT_LOG_FILE = path.join(__dirname, 'data', 'audit.log');
+
+  async function writeAuditLog(action, adminId, ip, extra = {}) {
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      action,
+      adminId: adminId || 'unknown',
+      ip: ip || 'unknown',
+      ...extra
+    }) + '\n';
+    fsp.appendFile(AUDIT_LOG_FILE, entry, 'utf8').catch(() => {});
+    console.log(`[AUDIT] ${action} | admin:${adminId} | ip:${ip}`);
+  }
+
+  // ==========================================
+  // JWT BLACKLIST (Logout invalidation via Redis)
+  // ==========================================
+  // When an admin logs out, their token jti is stored in Redis with TTL
+  // so even valid tokens cannot be re-used after logout.
+  async function blacklistToken(jti, ttlSeconds) {
+    if (!redisClient) return; // If no Redis, tokens expire naturally
+    try {
+      await redisClient.set(`blacklist:${jti}`, '1', 'EX', ttlSeconds);
+    } catch (err) {
+      console.warn('[JWT BLACKLIST] Failed to blacklist token:', err.message);
+    }
+  }
+
+  async function isTokenBlacklisted(jti) {
+    if (!redisClient || !jti) return false;
+    try {
+      const val = await redisClient.get(`blacklist:${jti}`);
+      return val === '1';
+    } catch {
+      return false; // Fail open — better UX than breaking auth
+    }
+  }
 
   // ==========================================
   // 2. DATA STORAGE & NON-BLOCKING CACHE
@@ -155,36 +241,46 @@ function startServerWorker() {
     }
   }
 
-  function createJWT(payload, expiresInSeconds = 86400) {
+  function createJWT(payload, expiresInSeconds = 86400, secret = JWT_SECRET) {
     const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
     const now = Math.floor(Date.now() / 1000);
+    // jti = JWT ID — unique per token, used for blacklisting on logout
+    const jti = crypto.randomBytes(16).toString('hex');
     const fullPayload = Buffer.from(JSON.stringify({
       ...payload,
+      jti,
       iat: now,
       exp: now + expiresInSeconds
     })).toString('base64url');
 
     const signature = crypto
-      .createHmac('sha256', JWT_SECRET)
+      .createHmac('sha256', secret)
       .update(`${header}.${fullPayload}`)
       .digest('base64url');
 
     return `${header}.${fullPayload}.${signature}`;
   }
 
-  function verifyJWT(token) {
+  // Creates a short-lived access token (15 min) + long-lived refresh token (7 days)
+  function createTokenPair(payload) {
+    const accessToken  = createJWT(payload, 15 * 60, JWT_SECRET);          // 15 minutes
+    const refreshToken = createJWT(payload, 7 * 24 * 3600, JWT_REFRESH_SECRET); // 7 days
+    return { accessToken, refreshToken };
+  }
+
+  function verifyJWT(token, secret = JWT_SECRET) {
     if (!token || typeof token !== 'string') return null;
     const parts = token.split('.');
     if (parts.length !== 3) return null;
 
     const [header, payload, signature] = parts;
     const expectedSignature = crypto
-      .createHmac('sha256', JWT_SECRET)
+      .createHmac('sha256', secret)
       .update(`${header}.${payload}`)
       .digest('base64url');
 
-    const sigBuf = Buffer.from(signature);
-    const expSigBuf = Buffer.from(expectedSignature);
+    const sigBuf = Buffer.from(signature, 'base64url');
+    const expSigBuf = Buffer.from(expectedSignature, 'base64url');
 
     if (sigBuf.length !== expSigBuf.length || !crypto.timingSafeEqual(sigBuf, expSigBuf)) {
       return null;
@@ -207,7 +303,19 @@ function startServerWorker() {
     return input
       .trim()
       .slice(0, maxLength)
-      .replace(/[<>]/g, '');
+      // Strip HTML/script injection chars
+      .replace(/[<>"'`]/g, '')
+      // Strip null bytes (bypass attempts)
+      .replace(/\0/g, '');
+  }
+
+  // Validate password strength: min 8 chars, at least 1 number, 1 uppercase
+  function isStrongPassword(password) {
+    if (!password || typeof password !== 'string') return false;
+    if (password.length < 8) return false;
+    if (!/[A-Z]/.test(password)) return false;
+    if (!/[0-9]/.test(password)) return false;
+    return true;
   }
 
   // ==========================================
@@ -396,44 +504,67 @@ function startServerWorker() {
   });
 
   // ==========================================
-  // 7. BATTLE-TESTED RATE LIMITING
+  // 7. REDIS-BACKED RATE LIMITING
+  // All limiters use Redis when available so that:
+  //   - Multi-worker cluster mode shares the same counters
+  //   - Server restarts don't reset attack windows
+  //   - Distributed deployments (multiple servers) share limits
+  // Falls back to in-memory store gracefully when Redis is unavailable.
   // ==========================================
 
-  // Standard API rate limiter (600 requests per 15 minutes per IP)
+  // General API limiter — 600 req / 15 min per IP
   const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 600,
     standardHeaders: true,
     legacyHeaders: false,
+    store: makeRedisStore('api'),
     message: { success: false, message: 'Too many requests. Please slow down and try again shortly.' }
   });
 
-  // Inquiry submission rate limiter (20 submissions per 15 minutes per IP to block spam bots)
+  // Inquiry submission limiter — 20 submissions / 15 min per IP
+  // Blocks form-spam bots and automated scrapers
   const inquiryLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 20,
     standardHeaders: true,
     legacyHeaders: false,
+    store: makeRedisStore('inquiry'),
     message: { success: false, message: 'Inquiry rate limit reached. Please wait a few moments before submitting again.' }
   });
 
-  // Admin login brute-force limiter (10 attempts per 15 mins per IP)
+  // Admin login brute-force limiter — 10 failed attempts / 15 min per IP
+  // skipSuccessfulRequests: legit logins don't burn the quota
   const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
     skipSuccessfulRequests: true,
     standardHeaders: true,
     legacyHeaders: false,
+    store: makeRedisStore('login'),
     message: { success: false, message: 'Too many failed login attempts. For security, please try again in 15 minutes.' }
   });
 
-  // OTP dispatch limiter (5 OTP requests per 10 minutes per IP)
+  // OTP dispatch limiter — 5 OTPs / 10 min per IP
+  // Prevents OTP flooding / SMS bombing attacks
   const otpLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
+    store: makeRedisStore('otp'),
     message: { success: false, message: 'Too many OTP requests. Please wait a few minutes before requesting another code.' }
+  });
+
+  // Password change limiter — 5 attempts / 30 min per IP
+  // Extra protection on sensitive credential-update endpoint
+  const passwordChangeLimiter = rateLimit({
+    windowMs: 30 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    store: makeRedisStore('pwchange'),
+    message: { success: false, message: 'Too many password change attempts. Please wait 30 minutes.' }
   });
 
   app.use('/api/', apiLimiter);
@@ -442,7 +573,7 @@ function startServerWorker() {
   // 8. AUTHENTICATION GUARD MIDDLEWARE
   // ==========================================
 
-  function requireAdminAuth(req, res, next) {
+  async function requireAdminAuth(req, res, next) {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({
@@ -452,12 +583,20 @@ function startServerWorker() {
     }
 
     const token = authHeader.split(' ')[1];
-    const decoded = verifyJWT(token);
+    const decoded = verifyJWT(token, JWT_SECRET);
 
     if (!decoded || (decoded.role !== 'Super Admin' && decoded.role !== 'Admin')) {
       return res.status(401).json({
         success: false,
         message: 'Unauthorized: Invalid or expired session token.'
+      });
+    }
+
+    // Check if this specific token has been blacklisted (e.g. after logout)
+    if (decoded.jti && await isTokenBlacklisted(decoded.jti)) {
+      return res.status(401).json({
+        success: false,
+        message: 'Session has been revoked. Please login again.'
       });
     }
 
@@ -635,7 +774,7 @@ function startServerWorker() {
         return res.status(400).json({ success: false, message: 'Admin ID and password are required.' });
       }
 
-      const cleanId = String(adminId).trim().toLowerCase();
+      const cleanId = String(adminId).trim().toLowerCase().slice(0, 120);
       let adminRecord = null;
 
       if (mongoose.connection.readyState === 1) {
@@ -658,21 +797,28 @@ function startServerWorker() {
           cleanId === (local.email || '').toLowerCase() ||
           cleanId === local.phone;
         
-        if (isMatch) {
-          adminRecord = local;
-        }
+        if (isMatch) adminRecord = local;
       }
 
+      const clientIp = req.ip || req.connection.remoteAddress;
+
       if (adminRecord && verifyPassword(password, adminRecord.password)) {
-        const token = createJWT({
+        // Issue short-lived access token + long-lived refresh token
+        const tokenPayload = {
           id: adminRecord.id,
           email: adminRecord.email,
           role: adminRecord.role || 'Super Admin'
-        }, 86400);
+        };
+        const { accessToken, refreshToken } = createTokenPair(tokenPayload);
+
+        // ✅ Audit: successful login
+        await writeAuditLog('ADMIN_LOGIN_SUCCESS', adminRecord.id, clientIp);
 
         return res.json({
           success: true,
-          token,
+          token: accessToken,           // 15-minute access token
+          refreshToken,                 // 7-day refresh token
+          expiresIn: 15 * 60,           // seconds
           admin: {
             id: adminRecord.id,
             email: adminRecord.email,
@@ -683,6 +829,9 @@ function startServerWorker() {
         });
       }
 
+      // ✅ Audit: failed login attempt
+      await writeAuditLog('ADMIN_LOGIN_FAILED', cleanId, clientIp, { reason: 'bad_credentials' });
+
       return res.status(401).json({
         success: false,
         message: 'Invalid administrative credentials. Please verify and try again.'
@@ -690,6 +839,79 @@ function startServerWorker() {
     } catch (err) {
       console.error('[ADMIN LOGIN ERROR]:', err);
       res.status(500).json({ success: false, message: 'Authentication service temporarily unavailable.' });
+    }
+  });
+
+  // ==========================================
+  // TOKEN REFRESH — Issue new access token using refresh token
+  // ==========================================
+  app.post('/api/admin/refresh-token', async (req, res) => {
+    try {
+      const { refreshToken } = req.body;
+      if (!refreshToken || typeof refreshToken !== 'string') {
+        return res.status(400).json({ success: false, message: 'Refresh token is required.' });
+      }
+
+      const decoded = verifyJWT(refreshToken, JWT_REFRESH_SECRET);
+      if (!decoded) {
+        return res.status(401).json({ success: false, message: 'Refresh token invalid or expired. Please login again.' });
+      }
+
+      // Check if refresh token itself is blacklisted
+      if (decoded.jti && await isTokenBlacklisted(decoded.jti)) {
+        return res.status(401).json({ success: false, message: 'Refresh token has been revoked. Please login again.' });
+      }
+
+      // Issue new access token only (not a new refresh token — prevents infinite rotation abuse)
+      const newAccessToken = createJWT({
+        id: decoded.id,
+        email: decoded.email,
+        role: decoded.role
+      }, 15 * 60, JWT_SECRET);
+
+      res.json({
+        success: true,
+        token: newAccessToken,
+        expiresIn: 15 * 60
+      });
+    } catch (err) {
+      console.error('[REFRESH TOKEN ERROR]:', err);
+      res.status(500).json({ success: false, message: 'Token refresh failed.' });
+    }
+  });
+
+  // ==========================================
+  // LOGOUT — Blacklist token in Redis
+  // ==========================================
+  app.post('/api/admin/logout', requireAdminAuth, async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const token = authHeader?.split(' ')[1];
+      const decoded = token ? verifyJWT(token, JWT_SECRET) : null;
+
+      if (decoded?.jti) {
+        const now = Math.floor(Date.now() / 1000);
+        const remainingTtl = Math.max(0, decoded.exp - now);
+        await blacklistToken(decoded.jti, remainingTtl + 60);
+      }
+
+      // Also blacklist the refresh token if sent
+      const { refreshToken } = req.body || {};
+      if (refreshToken) {
+        const rdecoded = verifyJWT(refreshToken, JWT_REFRESH_SECRET);
+        if (rdecoded?.jti) {
+          const now = Math.floor(Date.now() / 1000);
+          const remainingTtl = Math.max(0, rdecoded.exp - now);
+          await blacklistToken(rdecoded.jti, remainingTtl + 60);
+        }
+      }
+
+      await writeAuditLog('ADMIN_LOGOUT', req.admin?.id, req.ip);
+
+      res.json({ success: true, message: 'Logged out successfully. Session revoked.' });
+    } catch (err) {
+      console.error('[LOGOUT ERROR]:', err);
+      res.status(500).json({ success: false, message: 'Logout failed.' });
     }
   });
 
@@ -719,12 +941,16 @@ function startServerWorker() {
     }
   });
 
-  app.post('/api/admin/change-password', requireAdminAuth, async (req, res) => {
+  app.post('/api/admin/change-password', requireAdminAuth, passwordChangeLimiter, async (req, res) => {
     try {
       const { mode, oldPassword, otpCode, newPassword } = req.body;
 
-      if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
-        return res.status(400).json({ success: false, message: 'New password must be at least 6 characters long.' });
+      // Enforce strong password policy (min 8 chars, 1 uppercase, 1 number)
+      if (!isStrongPassword(newPassword)) {
+        return res.status(400).json({
+          success: false,
+          message: 'New password must be at least 8 characters with at least 1 uppercase letter and 1 number.'
+        });
       }
 
       let adminRecord = null;
@@ -773,6 +999,8 @@ function startServerWorker() {
         inMemoryAdmin.updatedAt = new Date().toISOString();
         fsp.writeFile(ADMIN_FILE, JSON.stringify(inMemoryAdmin, null, 2), 'utf8').catch(() => {});
       }
+
+      await writeAuditLog('ADMIN_PASSWORD_CHANGED', req.admin?.id, req.ip, { mode });
 
       res.json({
         success: true,
@@ -1171,7 +1399,7 @@ function startServerWorker() {
     }));
 
     // 6. SPA Catch-All fallback for clean browser URLs (/about, /services, /blog, etc.)
-    app.get('*', (req, res, next) => {
+    app.get('{*splat}', (req, res, next) => {
       if (req.path.startsWith('/api/')) {
         return next();
       }
@@ -1217,6 +1445,11 @@ function startServerWorker() {
           await fsp.writeFile(INQUIRIES_FILE, JSON.stringify(inMemoryInquiries.slice(0, 1000), null, 2), 'utf8');
         }
         await mongoose.connection.close();
+        // Gracefully disconnect Redis
+        if (redisClient) {
+          await redisClient.quit();
+          console.log(`[PROCESS ${process.pid}] 🔴 Redis disconnected.`);
+        }
         console.log(`[PROCESS ${process.pid}] ✅ Graceful shutdown complete.`);
         process.exit(0);
       } catch (err) {
